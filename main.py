@@ -1,3 +1,4 @@
+print("🤖 WHALE AGENT STARTING - TEST RUN")
 import os
 from dotenv import load_dotenv
 load_dotenv()
