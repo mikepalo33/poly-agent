@@ -1,4 +1,8 @@
-# requirements.txt: langchain==0.1.0 crewai==0.30.11 newsapi-python==0.2.7 py-clob-client==0.2.0 pinecone-client==3.2.2 openai==1.20.0
+    from crewai import Agent, Task, Crew
+    print("✅ CrewAI ready")
+except:
+    print("CrewAI loading...")
+    exit(1)# requirements.txt: langchain==0.1.0 crewai==0.30.11 newsapi-python==0.2.7 py-clob-client==0.2.0 pinecone-client==3.2.2 openai==1.20.0
 import os
 from crewai import Agent, Task, Crew
 from langchain_openai import ChatOpenAI
