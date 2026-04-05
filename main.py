@@ -28,7 +28,7 @@ AVG_EDGE_P = sum(WHALE_EDGES.values()) / len(WHALE_EDGES)
 
 def kelly_size(our_p, implied_p):
     b = abs((1 - implied_p) / implied_p)
-    f = max(0, (our_p - (1 - our_p
+    f = max(0, (our_p - (1 - our_p)
     exit(1)# requirements.txt: langchain==0.1.0 crewai==0.30.11 newsapi-python==0.2.7 py-clob-client==0.2.0 pinecone-client==3.2.2 openai==1.20.0
 import os
 from crewai import Agent, Task, Crew
