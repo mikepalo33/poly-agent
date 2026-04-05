@@ -1,7 +1,6 @@
 crewai
-langchain-openai
-newsapi-python
+openai
 requests
 python-dotenv
-numpy
-openai
+py-clob-client
+newsapi-python
