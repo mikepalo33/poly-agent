@@ -1,0 +1,7 @@
+langchain==0.1.0
+crewai==0.30.11
+newsapi-python==0.2.7
+py-clob-client==0.2.0
+pinecone-client==3.2.2
+openai==1.20.0
+python-dotenv==1.0.0
