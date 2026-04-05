@@ -1,7 +1,7 @@
-crewai==1.13.0
-langchain-openai==0.2.2
-newsapi-python==0.2.7
-requests==2.32.3
-python-dotenv==1.0.1
-numpy==1.26.4
-openai==1.83.0
+crewai
+langchain-openai
+newsapi-python
+requests
+python-dotenv
+numpy
+openai
