@@ -1,7 +1,34 @@
-    from crewai import Agent, Task, Crew
-    print("✅ CrewAI ready")
-except:
-    print("CrewAI loading...")
+import os
+from dotenv import load_dotenv
+load_dotenv()
+
+from crewai import Agent, Task, Crew
+from langchain_openai import ChatOpenAI
+import numpy as np
+
+print("✅ Imports success - Polymarket agent starting")
+
+# Mock data for deploy test
+def get_open_markets():
+    return [{"id": "trump-2028", "yes_price": 0.52, "no_price": 0.48, "title": "Trump 2028 Win"}]
+
+llm = ChatOpenAI(model="gpt-4o-mini")
+
+# Your 7 whale edges
+WHALE_EDGES = {
+    'kch123': 0.74,
+    'Axios': 0.96,
+    'HaileyWelsh': 0.65,
+    '0xd218': 0.65,
+    'swisstony': 0.70,
+    'majorexploiter': 0.72,
+    'bcda': 0.68
+}
+AVG_EDGE_P = sum(WHALE_EDGES.values()) / len(WHALE_EDGES)
+
+def kelly_size(our_p, implied_p):
+    b = abs((1 - implied_p) / implied_p)
+    f = max(0, (our_p - (1 - our_p
     exit(1)# requirements.txt: langchain==0.1.0 crewai==0.30.11 newsapi-python==0.2.7 py-clob-client==0.2.0 pinecone-client==3.2.2 openai==1.20.0
 import os
 from crewai import Agent, Task, Crew
