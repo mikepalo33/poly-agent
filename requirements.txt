@@ -1,6 +1,2 @@
-crewai
-openai
 requests
-python-dotenv
-py-clob-client
-newsapi-python
+cryptography
