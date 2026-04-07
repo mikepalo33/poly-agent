@@ -22,7 +22,11 @@ import datetime as dt
 from typing import List, Dict, Any
 
 import requests
+import os
 
+key_path = os.environ["KALSHI_PRIVATE_KEY_PATH"]
+with open(key_path, "rb") as f:
+    private_key = f.read()
 
 # ---------- CONFIG ----------
 
