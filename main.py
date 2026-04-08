@@ -1,29 +1,31 @@
 #!/usr/bin/env python3
 """
-Kalshi Agent v0.2 — PAPER or LIVE
+Kalshi Agent v0.3 — PAPER or LIVE
 
-- Fetch open Kalshi markets
-- Filter by liquidity, spread, time to expiry, category
-- Estimate agent probability vs crowd
-- Compute fractional Kelly size with risk caps
-- If PAPER_MODE=1: log PAPER trades only
-- If PAPER_MODE=0: place real limit orders via Kalshi API
+Signal Stack (in order of priority):
+  1. Polymarket cross-reference arbitrage (real-time price comparison)
+  2. NewsAPI headline sentiment (keyword search on market title)
+  3. Baseline calibration nudge (conservative floor)
 
 Required environment variables:
-  KALSHI_API_KEY        (your Kalshi API Key ID)
-  KALSHI_PRIVATE_KEY_PATH (filesystem path to your Kalshi private key file)
+  KALSHI_API_KEY              Kalshi API Key ID
+  KALSHI_PRIVATE_KEY_PATH     Path to Kalshi PEM private key file
 
 Optional environment variables:
-  BASE_URL              (default: https://api.elections.kalshi.com/trade-api/v2)
-  BANKROLL              (float, default 10000)
-  MIN_VOLUME            (float, default 5000)
-  MAX_FRACTIONAL_KELLY  (float, default 0.01)
-  MIN_EDGE              (float, default 0.08)
-  MAX_SPREAD_CENTS      (float, default 6)
-  MAX_MARKETS_PER_RUN   (int,   default 5)
-  MIN_DOLLAR_TRADE      (float, default 50)
-  PER_MARKET_EXPOSURE_CAP (float, default 0.02)
-  PAPER_MODE            ("1" for paper, "0" for live)
+  BASE_URL                    (default: https://api.elections.kalshi.com/trade-api/v2)
+  NEWSAPI_KEY                 NewsAPI key for headline sentiment
+  PAPER_MODE                  "1" = paper log only, "0" = place real orders (default: "1")
+  BANKROLL                    float (default: 10000)
+  MIN_VOLUME                  float (default: 1000)
+  MAX_FRACTIONAL_KELLY        float (default: 0.01)
+  MIN_EDGE                    float (default: 0.03)
+  MAX_SPREAD_CENTS            float (default: 8)
+  MAX_MARKETS_PER_RUN         int   (default: 5)
+  MIN_DOLLAR_TRADE            float (default: 25)
+  PER_MARKET_EXPOSURE_CAP     float (default: 0.02)
+  POLY_WEIGHT                 float (default: 0.6)  weight given to polymarket signal
+  NEWS_WEIGHT                 float (default: 0.2)  weight given to news sentiment
+  POSITIONS_FILE              path  (default: /app/positions.json)
 """
 
 import os
@@ -31,8 +33,9 @@ import math
 import time
 import uuid
 import json
+import difflib
 import datetime as dt
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 import requests
 import base64
@@ -42,118 +45,242 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.backends import default_backend
 
-# ---------- CONFIG ----------
+# ───────────────────────── CONFIG ──────────────────────────
 
-BASE_URL = os.getenv(
-    "BASE_URL",
-    "https://api.elections.kalshi.com/trade-api/v2",
-)
-
-API_KEY_ID = os.environ.get("KALSHI_API_KEY")
-
-if API_KEY_ID is None:
-    raise RuntimeError("KALSHI_API_KEY environment variable is required for authenticated trading.")
-
-PRIVATE_KEY_PATH = os.environ.get("KALSHI_PRIVATE_KEY_PATH")
-if PRIVATE_KEY_PATH is None:
-    raise RuntimeError("KALSHI_PRIVATE_KEY_PATH environment variable is required for authenticated trading.")
-
-PAPER_MODE = os.getenv("PAPER_MODE", "1")  # "1" = paper, "0" = live
+BASE_URL = os.getenv("BASE_URL", "https://api.elections.kalshi.com/trade-api/v2")
+API_KEY_ID = os.environ["KALSHI_API_KEY"]
+PRIVATE_KEY_PATH = os.environ["KALSHI_PRIVATE_KEY_PATH"]
+NEWSAPI_KEY = os.getenv("NEWSAPI_KEY", "")
+PAPER_MODE = os.getenv("PAPER_MODE", "1")
+POSITIONS_FILE = os.getenv("POSITIONS_FILE", "/app/positions.json")
 
 BANKROLL = float(os.getenv("BANKROLL", "10000"))
-MIN_VOLUME = float(os.getenv("MIN_VOLUME", "5000"))
+MIN_VOLUME = float(os.getenv("MIN_VOLUME", "1000"))
 MAX_FRACTIONAL_KELLY = float(os.getenv("MAX_FRACTIONAL_KELLY", "0.01"))
-MIN_EDGE = float(os.getenv("MIN_EDGE", "0.08"))
-MAX_SPREAD_CENTS = float(os.getenv("MAX_SPREAD_CENTS", "6"))
+MIN_EDGE = float(os.getenv("MIN_EDGE", "0.03"))
+MAX_SPREAD_CENTS = float(os.getenv("MAX_SPREAD_CENTS", "8"))
 MAX_MARKETS_PER_RUN = int(os.getenv("MAX_MARKETS_PER_RUN", "5"))
-MIN_DOLLAR_TRADE = float(os.getenv("MIN_DOLLAR_TRADE", "50"))
+MIN_DOLLAR_TRADE = float(os.getenv("MIN_DOLLAR_TRADE", "25"))
 PER_MARKET_EXPOSURE_CAP = float(os.getenv("PER_MARKET_EXPOSURE_CAP", "0.02"))
+POLY_WEIGHT = float(os.getenv("POLY_WEIGHT", "0.6"))
+NEWS_WEIGHT = float(os.getenv("NEWS_WEIGHT", "0.2"))
 
-ALLOWED_CATEGORIES = {
-    "SPORTS",
-    "ELECTIONS",
-    "ECONOMIC",
-}
-
-# ---------- TIME / LOGGING ----------
+# ───────────────────────── LOGGING ─────────────────────────
 
 def ts() -> str:
     return dt.datetime.now().strftime("%H:%M:%S")
 
-# ---------- AUTH HELPERS (from Kalshi docs) ---------- [web:611][web:819]
+def log(msg: str) -> None:
+    print(f"{ts()} | {msg}", flush=True)
+
+# ───────────────────────── AUTH ────────────────────────────
 
 def load_private_key(path: str):
     with open(path, "rb") as f:
         return serialization.load_pem_private_key(
-            f.read(),
-            password=None,
-            backend=default_backend(),
+            f.read(), password=None, backend=default_backend()
         )
 
 def create_signature(private_key, timestamp: str, method: str, path: str) -> str:
-    """
-    Create the request signature.
-
-    path must be the URL path (no scheme/host), e.g. /trade-api/v2/portfolio/orders.
-    """
-    path_without_query = path.split("?")[0]
-    message = f"{timestamp}{method}{path_without_query}".encode("utf-8")
-    signature = private_key.sign(
+    path_no_query = path.split("?")[0]
+    message = f"{timestamp}{method}{path_no_query}".encode()
+    sig = private_key.sign(
         message,
-        padding.PSS(
-            mgf=padding.MGF1(hashes.SHA256()),
-            salt_length=padding.PSS.DIGEST_LENGTH,
-        ),
+        padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH),
         hashes.SHA256(),
     )
-    return base64.b64encode(signature).decode("utf-8")
+    return base64.b64encode(sig).decode()
 
 def auth_headers(private_key, method: str, full_path: str) -> Dict[str, str]:
-    """
-    Build authenticated headers for a request. [web:611]
-    """
-    timestamp = str(int(dt.datetime.now().timestamp() * 1000))
+    ts_ms = str(int(dt.datetime.now().timestamp() * 1000))
     sign_path = urlparse(BASE_URL + full_path).path
-    signature = create_signature(private_key, timestamp, method, sign_path)
+    sig = create_signature(private_key, ts_ms, method, sign_path)
     return {
         "KALSHI-ACCESS-KEY": API_KEY_ID,
-        "KALSHI-ACCESS-SIGNATURE": signature,
-        "KALSHI-ACCESS-TIMESTAMP": timestamp,
+        "KALSHI-ACCESS-SIGNATURE": sig,
+        "KALSHI-ACCESS-TIMESTAMP": ts_ms,
     }
 
-def kalshi_get(private_key, path: str, params: Dict[str, Any] | None = None) -> requests.Response:
-    headers = auth_headers(private_key, "GET", path)
-    return requests.get(BASE_URL + path, headers=headers, params=params, timeout=20)
+def kalshi_get(pkey, path: str, params: Optional[Dict] = None) -> requests.Response:
+    return requests.get(BASE_URL + path, headers=auth_headers(pkey, "GET", path), params=params, timeout=20)
 
-def kalshi_post(private_key, path: str, data: Dict[str, Any]) -> requests.Response:
-    headers = auth_headers(private_key, "POST", path)
-    headers["Content-Type"] = "application/json"
-    return requests.post(BASE_URL + path, headers=headers, data=json.dumps(data), timeout=20)
+def kalshi_post(pkey, path: str, data: Dict) -> requests.Response:
+    hdrs = auth_headers(pkey, "POST", path)
+    hdrs["Content-Type"] = "application/json"
+    return requests.post(BASE_URL + path, headers=hdrs, data=json.dumps(data), timeout=20)
 
-# Load private key once
 PRIVATE_KEY = load_private_key(PRIVATE_KEY_PATH)
 
-# ---------- PUBLIC MARKET DATA (can be unauthenticated but we reuse helpers) ---------- [web:742][web:811]
+# ───────────────────────── POSITION PERSISTENCE ────────────
+
+def load_positions() -> Dict[str, float]:
+    try:
+        if os.path.exists(POSITIONS_FILE):
+            with open(POSITIONS_FILE) as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+def save_positions(positions: Dict[str, float]) -> None:
+    try:
+        with open(POSITIONS_FILE, "w") as f:
+            json.dump(positions, f, indent=2)
+    except Exception as e:
+        log(f"⚠️  Could not save positions: {e}")
+
+# ───────────────────────── POLYMARKET SIGNAL ───────────────
+
+_poly_cache: Optional[List[Dict]] = None
+_poly_cache_ts: float = 0.0
+POLY_CACHE_TTL = 300  # seconds
+
+def fetch_polymarket_markets() -> List[Dict]:
+    global _poly_cache, _poly_cache_ts
+    now = time.time()
+    if _poly_cache and (now - _poly_cache_ts) < POLY_CACHE_TTL:
+        return _poly_cache
+    try:
+        r = requests.get(
+            "https://gamma-api.polymarket.com/markets",
+            params={"active": "true", "closed": "false", "order": "volume", "limit": 200},
+            timeout=15,
+        )
+        r.raise_for_status()
+        _poly_cache = r.json()
+        _poly_cache_ts = now
+        log(f"📊 Polymarket: loaded {len(_poly_cache)} markets")
+        return _poly_cache
+    except Exception as e:
+        log(f"⚠️  Polymarket fetch failed: {e}")
+        return []
+
+def fuzzy_match_poly(kalshi_title: str, poly_markets: List[Dict], cutoff: float = 0.55) -> Optional[Dict]:
+    """
+    Return the best-matching Polymarket market by question similarity.
+    """
+    if not poly_markets:
+        return None
+    k_lower = kalshi_title.lower()
+    best_ratio = 0.0
+    best_market = None
+    for pm in poly_markets:
+        q = (pm.get("question") or "").lower()
+        ratio = difflib.SequenceMatcher(None, k_lower, q).ratio()
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_market = pm
+    if best_ratio >= cutoff:
+        return best_market
+    return None
+
+def polymarket_signal(kalshi_market: Dict, poly_markets: List[Dict]) -> float:
+    """
+    Compare Kalshi YES mid price to matched Polymarket YES price.
+    Returns raw probability adjustment (positive = Kalshi underpriced vs Poly).
+    """
+    title = kalshi_market.get("title") or ""
+    pm = fuzzy_match_poly(title, poly_markets)
+    if pm is None:
+        return 0.0
+
+    prices = pm.get("outcomePrices")
+    if not prices:
+        return 0.0
+    try:
+        poly_yes = float(prices[0])
+    except (ValueError, IndexError):
+        return 0.0
+
+    kalshi_mid = kalshi_market.get("mid_yes_cents", 50.0) / 100.0
+    delta = poly_yes - kalshi_mid
+    return delta
+
+# ───────────────────────── NEWS SIGNAL ─────────────────────
+
+_news_cache: Dict[str, float] = {}
+_news_cache_ts: Dict[str, float] = {}
+NEWS_CACHE_TTL = 600  # 10 minutes
+
+POSITIVE_WORDS = {
+    "win", "surge", "rise", "up", "gain", "beat", "approve", "pass", "confirm",
+    "victory", "lead", "ahead", "strong", "boost", "increase", "record", "high",
+}
+NEGATIVE_WORDS = {
+    "lose", "fall", "drop", "down", "miss", "fail", "reject", "decline", "cut",
+    "crash", "weak", "low", "loss", "defeat", "behind", "concern", "risk",
+}
+
+def extract_keywords(title: str) -> str:
+    stopwords = {"will", "the", "a", "an", "in", "of", "be", "by", "for",
+                 "at", "to", "is", "or", "and", "on", "have", "with", "above", "below"}
+    words = [w for w in title.lower().split() if w.isalpha() and w not in stopwords and len(w) > 2]
+    return " ".join(words[:5])
+
+def news_boost_for_market(m: Dict[str, Any]) -> float:
+    """
+    Fetch top headlines for the market title and return a sentiment boost [-0.1, +0.1].
+    Returns 0 if NEWSAPI_KEY is not set or on error.
+    """
+    if not NEWSAPI_KEY:
+        return 0.0
+
+    title = m.get("title") or ""
+    query = extract_keywords(title)
+    if not query:
+        return 0.0
+
+    now = time.time()
+    if query in _news_cache and (now - _news_cache_ts.get(query, 0)) < NEWS_CACHE_TTL:
+        return _news_cache[query]
+
+    try:
+        r = requests.get(
+            "https://newsapi.org/v2/everything",
+            params={
+                "q": query,
+                "language": "en",
+                "sortBy": "relevancy",
+                "pageSize": 10,
+                "apiKey": NEWSAPI_KEY,
+            },
+            timeout=10,
+        )
+        r.raise_for_status()
+        articles = r.json().get("articles", [])
+        if not articles:
+            _news_cache[query] = 0.0
+            _news_cache_ts[query] = now
+            return 0.0
+
+        pos, neg = 0, 0
+        for art in articles:
+            text = ((art.get("title") or "") + " " + (art.get("description") or "")).lower()
+            pos += sum(1 for w in POSITIVE_WORDS if w in text)
+            neg += sum(1 for w in NEGATIVE_WORDS if w in text)
+
+        total = pos + neg
+        if total == 0:
+            boost = 0.0
+        else:
+            boost = round(((pos - neg) / total) * 0.10, 4)
+
+        _news_cache[query] = boost
+        _news_cache_ts[query] = now
+        return boost
+
+    except Exception as e:
+        log(f"⚠️  NewsAPI error for '{query}': {e}")
+        return 0.0
+
+# ───────────────────────── KALSHI MARKETS ──────────────────
 
 def fetch_open_markets(limit: int = 300) -> List[Dict[str, Any]]:
-    """
-    Fetch open markets from Kalshi.
-    """
-    # either unauthenticated GET or authenticated GET; we use authenticated for consistency
-    path = "/markets"
-    params = {
-        "limit": limit,
-        "status": "open",
-    }
-    # Public endpoint, but using kalshi_get keeps signature pattern consistent
-    r = kalshi_get(PRIVATE_KEY, path, params=params)
+    r = kalshi_get(PRIVATE_KEY, "/markets", {"limit": limit, "status": "open"})
     r.raise_for_status()
-    data = r.json()
-    return data.get("markets", [])
+    return r.json().get("markets", [])
 
-# ---------- PRICING / FILTERS ----------
-
-def compute_mid_yes_price_cents(m: Dict[str, Any]) -> float | None:
+def compute_mid_yes_price_cents(m: Dict[str, Any]) -> Optional[float]:
     bid = m.get("yes_bid")
     ask = m.get("yes_ask")
     if bid is not None and ask is not None:
@@ -169,9 +296,9 @@ def basic_filters(markets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     now_ts = int(time.time())
 
     for m in markets:
-        vol = float(m.get("volume") or 0)
-        category = (m.get("category") or "").upper()
-        close_ts = int(m.get("close_ts") or 0)
+        # Use 24h volume if available, fall back to cumulative
+        vol = float(m.get("volume_24h") or m.get("volume") or 0)
+        close_ts = int(m.get("close_time") or m.get("close_ts") or 0)
         yes_mid = compute_mid_yes_price_cents(m)
         if yes_mid is None:
             continue
@@ -185,62 +312,59 @@ def basic_filters(markets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         hours_to_close = (close_ts - now_ts) / 3600.0
         if hours_to_close < 6 or hours_to_close > 30 * 24:
             continue
-
         if vol < MIN_VOLUME:
             continue
         if spread > MAX_SPREAD_CENTS:
             continue
-        if not (15 <= yes_mid <= 85):
-            continue
-
-        if category and category not in ALLOWED_CATEGORIES:
+        if not (10 <= yes_mid <= 90):
             continue
 
         m["mid_yes_cents"] = yes_mid
         m["hours_to_close"] = hours_to_close
+        m["volume_used"] = vol
         filtered.append(m)
 
-    print(f"{ts()} | Filtered down to {len(filtered)} candidate markets")
+    log(f"Filtered down to {len(filtered)} candidate markets")
     return filtered
 
-def historical_calibration_adjust(price_prob: float, category: str) -> float:
-    if price_prob < 0.2:
-        adj = 0.02
-    elif price_prob < 0.3:
-        adj = 0.02
-    elif price_prob < 0.5:
-        adj = 0.01
-    else:
-        adj = 0.0
-    return max(min(price_prob + adj, 0.99), 0.01)
+# ───────────────────────── PROBABILITY MODEL ───────────────
 
-def news_boost_for_market(m: Dict[str, Any]) -> float:
+def baseline_calibration(price_prob: float) -> float:
+    """Conservative baseline nudge; overridden heavily by real signals."""
+    if price_prob < 0.3:
+        return 0.01
+    if price_prob < 0.5:
+        return 0.005
     return 0.0
 
-def kelly_fraction(p_agent: float, p_crowd: float) -> float:
-    if p_crowd <= 0.0 or p_crowd >= 1.0:
-        return 0.0
-
-    b = (1.0 - p_crowd) / p_crowd
-    if b <= 0:
-        return 0.0
-
-    numer = p_agent * b - (1.0 - p_agent)
-    f = numer / b
-    return max(0.0, min(f, MAX_FRACTIONAL_KELLY))
-
-def score_market(m: Dict[str, Any]) -> Dict[str, Any]:
+def score_market(m: Dict[str, Any], poly_markets: List[Dict]) -> Dict[str, Any]:
     yes_mid_cents = float(m["mid_yes_cents"])
     p_crowd = yes_mid_cents / 100.0
-    category = (m.get("category") or "").upper()
 
-    p_model = historical_calibration_adjust(p_crowd, category)
-    p_agent = max(min(p_model + news_boost_for_market(m), 0.99), 0.01)
+    # Layer 1: baseline
+    base_adj = baseline_calibration(p_crowd)
+
+    # Layer 2: Polymarket cross-ref
+    poly_delta = polymarket_signal(m, poly_markets)
+
+    # Layer 3: News sentiment
+    news_delta = news_boost_for_market(m)
+
+    # Combine: baseline is the floor, poly and news are weighted
+    p_agent = p_crowd + base_adj + (POLY_WEIGHT * poly_delta) + (NEWS_WEIGHT * news_delta)
+    p_agent = max(0.01, min(0.99, p_agent))
 
     edge = p_agent - p_crowd
-    f_kelly = kelly_fraction(p_agent, p_crowd)
 
-    vol = float(m.get("volume") or 0.0)
+    # Kelly fraction
+    f_kelly = 0.0
+    if 0.0 < p_crowd < 1.0:
+        b = (1.0 - p_crowd) / p_crowd
+        if b > 0:
+            f = (p_agent * b - (1.0 - p_agent)) / b
+            f_kelly = max(0.0, min(f, MAX_FRACTIONAL_KELLY))
+
+    vol = m["volume_used"]
     hours_to_close = m["hours_to_close"]
     time_weight = math.exp(-abs(hours_to_close - 72.0) / 72.0)
     score = abs(edge) * math.log1p(vol) * time_weight
@@ -248,9 +372,11 @@ def score_market(m: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "ticker": m.get("ticker"),
         "title": m.get("title"),
-        "category": category,
         "p_crowd": p_crowd,
         "p_agent": p_agent,
+        "base_adj": base_adj,
+        "poly_delta": poly_delta,
+        "news_delta": news_delta,
         "edge": edge,
         "kelly": f_kelly,
         "score": score,
@@ -259,41 +385,35 @@ def score_market(m: Dict[str, Any]) -> Dict[str, Any]:
         "hours_to_close": hours_to_close,
     }
 
-# ---------- RISK / SIZING ----------
+# ───────────────────────── RISK & SIZING ───────────────────
 
-current_exposure_by_ticker: Dict[str, float] = {}
-
-def allowed_size_dollars(ticker: str, f_kelly: float) -> float:
+def allowed_size_dollars(ticker: str, f_kelly: float, exposure: Dict[str, float]) -> float:
     raw = BANKROLL * f_kelly
-    per_market_cap = BANKROLL * PER_MARKET_EXPOSURE_CAP
-    already = current_exposure_by_ticker.get(ticker, 0.0)
-    remaining = max(0.0, per_market_cap - already)
+    cap = BANKROLL * PER_MARKET_EXPOSURE_CAP
+    already = exposure.get(ticker, 0.0)
+    remaining = max(0.0, cap - already)
     return min(raw, remaining)
 
-def risk_filter_and_size(scored: Dict[str, Any]) -> float:
+def risk_filter_and_size(scored: Dict[str, Any], exposure: Dict[str, float]) -> float:
     if abs(scored["edge"]) < MIN_EDGE:
         return 0.0
     if scored["kelly"] <= 0.0:
         return 0.0
-
-    size = allowed_size_dollars(scored["ticker"], scored["kelly"])
+    size = allowed_size_dollars(scored["ticker"], scored["kelly"], exposure)
     if size < MIN_DOLLAR_TRADE:
         return 0.0
     return size
 
-# ---------- ORDER PLACEMENT ---------- [web:819][web:820]
+# ───────────────────────── ORDER PLACEMENT ─────────────────
 
-def place_order_live(scored: Dict[str, Any], size_usd: float) -> Dict[str, Any]:
+def place_order_live(scored: Dict[str, Any], size_usd: float) -> Dict:
     side = "yes" if scored["edge"] > 0 else "no"
-    ticker = scored["ticker"]
-    yes_price_cents = int(round(scored["yes_mid_cents"]))  # simple: hit mid; you can shade
-    yes_price_cents = max(1, min(99, yes_price_cents))
-
+    yes_price_cents = max(1, min(99, int(round(scored["yes_mid_cents"]))))
     price_dollars = yes_price_cents / 100.0
     contracts = max(1, int(size_usd / max(price_dollars, 0.01)))
 
     order_data = {
-        "ticker": ticker,
+        "ticker": scored["ticker"],
         "action": "buy",
         "side": side,
         "type": "limit",
@@ -304,86 +424,97 @@ def place_order_live(scored: Dict[str, Any], size_usd: float) -> Dict[str, Any]:
         "time_in_force": "fill_or_kill",
     }
 
-    path = "/portfolio/orders"
-    response = kalshi_post(PRIVATE_KEY, path, order_data)
-    if response.status_code not in (200, 201):
-        raise RuntimeError(f"Order error {response.status_code}: {response.text}")
+    resp = kalshi_post(PRIVATE_KEY, "/portfolio/orders", order_data)
+    if resp.status_code not in (200, 201):
+        raise RuntimeError(f"HTTP {resp.status_code}: {resp.text}")
+    return resp.json()
 
-    return {
-        "order_response": response.json(),
-        "order_data": order_data,
-    }
-
-# ---------- MAIN LOOP ----------
+# ───────────────────────── MAIN ────────────────────────────
 
 def run_agent_once() -> None:
     mode_str = "PAPER" if PAPER_MODE == "1" else "LIVE"
-    print("\n" + "=" * 60)
-    print(f"🤖 Kalshi Agent v0.2 | {mode_str} | {dt.datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    print("=" * 60)
+    print("\n" + "=" * 65)
+    print(f"🤖 Kalshi Agent v0.3 | {mode_str} | {dt.datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print("=" * 65)
 
+    # Load persistent exposure
+    exposure = load_positions()
+
+    # Fetch Polymarket cache once per run
+    poly_markets = fetch_polymarket_markets()
+
+    # Fetch Kalshi markets
     try:
         markets = fetch_open_markets(limit=300)
     except Exception as e:
-        print(f"{ts()} | Error fetching markets: {e}")
+        log(f"❌ Error fetching Kalshi markets: {e}")
         return
 
-    print(f"{ts()} | Fetched {len(markets)} open markets from Kalshi")
+    log(f"Fetched {len(markets)} open markets from Kalshi")
 
     candidates = basic_filters(markets)
     if not candidates:
-        print(f"{ts()} | No candidates after filters. Done.")
-        print("=" * 60 + "\n")
+        log("No candidates after filters. Done.")
+        print("=" * 65 + "\n")
         return
 
-    scored = [score_market(m) for m in candidates]
+    scored = [score_market(m, poly_markets) for m in candidates]
     scored.sort(key=lambda x: x["score"], reverse=True)
+
+    # Print top 10 candidates for transparency
+    log(f"Top scored candidates (before risk filter):")
+    for s in scored[:10]:
+        print(
+            f"   {s['ticker'][:30]:30s} "
+            f"p_crowd={s['p_crowd']:.2f} p_agent={s['p_agent']:.2f} "
+            f"edge={s['edge']:+.3f} "
+            f"poly_Δ={s['poly_delta']:+.3f} news_Δ={s['news_delta']:+.3f}"
+        )
 
     trades = []
     for s in scored:
         if len(trades) >= MAX_MARKETS_PER_RUN:
             break
-
-        size_usd = risk_filter_and_size(s)
+        size_usd = risk_filter_and_size(s, exposure)
         if size_usd <= 0.0:
             continue
-
         trades.append((s, size_usd))
-        ticker = s["ticker"]
-        current_exposure_by_ticker[ticker] = current_exposure_by_ticker.get(ticker, 0.0) + size_usd
+        exposure[s["ticker"]] = exposure.get(s["ticker"], 0.0) + size_usd
 
     if not trades:
-        print(f"{ts()} | No trades passed risk filters.")
-        print("=" * 60 + "\n")
+        log("No trades passed risk filters.")
+        print("=" * 65 + "\n")
         return
 
+    print()
     for s, size_usd in trades:
         side = "YES" if s["edge"] > 0 else "NO"
         yes_price = s["yes_mid_cents"] / 100.0
-        title = (s["title"] or "")[:80]
+        title = (s["title"] or "")[:70]
 
         if PAPER_MODE == "1":
             contracts = max(1, int(size_usd / max(yes_price, 0.01)))
-            print(
-                f"{ts()} | 📋 PAPER {side} {s['ticker']} '{title}' "
+            log(
+                f"📋 PAPER {side} {s['ticker']} '{title}' "
                 f"${size_usd:.2f} @ ${yes_price:.2f} "
-                f"(p_crowd={s['p_crowd']:.2f}, p_agent={s['p_agent']:.2f}, edge={s['edge']:.2f}, "
-                f"contracts={contracts})"
+                f"(p_crowd={s['p_crowd']:.2f} p_agent={s['p_agent']:.2f} "
+                f"edge={s['edge']:+.3f} contracts={contracts})"
             )
         else:
             try:
                 result = place_order_live(s, size_usd)
-                order = result["order_response"].get("order", {})
-                print(
-                    f"{ts()} | ✅ LIVE {side} {s['ticker']} '{title}' "
+                order = result.get("order", {})
+                log(
+                    f"✅ LIVE {side} {s['ticker']} '{title}' "
                     f"${size_usd:.2f} @ ~${yes_price:.2f} "
-                    f"status={order.get('status')} order_id={order.get('order_id')}"
+                    f"status={order.get('status')} id={order.get('order_id')}"
                 )
             except Exception as e:
-                print(f"{ts()} | ❌ Order failed for {s['ticker']}: {e}")
+                log(f"❌ Order failed for {s['ticker']}: {e}")
 
-    print(f"{ts()} | ✅ AGENT COMPLETE — {len(trades)} trade(s) processed in {mode_str} mode")
-    print("=" * 60 + "\n")
+    save_positions(exposure)
+    log(f"✅ AGENT COMPLETE — {len(trades)} trade(s) in {mode_str} mode")
+    print("=" * 65 + "\n")
 
 
 if __name__ == "__main__":
