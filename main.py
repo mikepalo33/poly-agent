@@ -298,7 +298,11 @@ def basic_filters(markets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     for m in markets:
         # Use 24h volume if available, fall back to cumulative
         vol = float(m.get("volume_24h") or m.get("volume") or 0)
-        close_ts = int(m.get("close_time") or m.get("close_ts") or 0)
+        _ct = m.get("close_time") or m.get("close_ts") or ""
+try:
+    close_ts = int(_ct) if str(_ct).isdigit() else int(dt.datetime.fromisoformat(_ct.replace("Z", "+00:00")).timestamp())
+except Exception:
+    continue
         yes_mid = compute_mid_yes_price_cents(m)
         if yes_mid is None:
             continue
