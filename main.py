@@ -281,7 +281,7 @@ def fetch_open_markets(limit: int = 300) -> List[Dict[str, Any]]:
     return r.json().get("markets", [])
 
 def compute_mid_yes_price_cents(m: Dict[str, Any]) -> Optional[float]:
-    # Try numeric cent fields first (if present)
+    # Try numeric cent fields first
     bid = m.get("yes_bid")
     ask = m.get("yes_ask")
 
@@ -302,195 +302,69 @@ def compute_mid_yes_price_cents(m: Dict[str, Any]) -> Optional[float]:
         return float(bid)
     return None
 
-# ───────────────────────── PROBABILITY MODEL ───────────────
+def basic_filters(markets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    filtered: List[Dict[str, Any]] = []
+    now_ts = int(time.time())
 
-def baseline_calibration(price_prob: float) -> float:
-    """Conservative baseline nudge; overridden heavily by real signals."""
-    if price_prob < 0.3:
-        return 0.01
-    if price_prob < 0.5:
-        return 0.005
-    return 0.0
-
-def score_market(m: Dict[str, Any], poly_markets: List[Dict]) -> Dict[str, Any]:
-    yes_mid_cents = float(m["mid_yes_cents"])
-    p_crowd = yes_mid_cents / 100.0
-
-    # Layer 1: baseline
-    base_adj = baseline_calibration(p_crowd)
-
-    # Layer 2: Polymarket cross-ref
-    poly_delta = polymarket_signal(m, poly_markets)
-
-    # Layer 3: News sentiment
-    news_delta = news_boost_for_market(m)
-
-    # Combine: baseline is the floor, poly and news are weighted
-    p_agent = p_crowd + base_adj + (POLY_WEIGHT * poly_delta) + (NEWS_WEIGHT * news_delta)
-    p_agent = max(0.01, min(0.99, p_agent))
-
-    edge = p_agent - p_crowd
-
-    # Kelly fraction
-    f_kelly = 0.0
-    if 0.0 < p_crowd < 1.0:
-        b = (1.0 - p_crowd) / p_crowd
-        if b > 0:
-            f = (p_agent * b - (1.0 - p_agent)) / b
-            f_kelly = max(0.0, min(f, MAX_FRACTIONAL_KELLY))
-
-    vol = m["volume_used"]
-    hours_to_close = m["hours_to_close"]
-    time_weight = math.exp(-abs(hours_to_close - 72.0) / 72.0)
-    score = abs(edge) * math.log1p(vol) * time_weight
-
-    return {
-        "ticker": m.get("ticker"),
-        "title": m.get("title"),
-        "p_crowd": p_crowd,
-        "p_agent": p_agent,
-        "base_adj": base_adj,
-        "poly_delta": poly_delta,
-        "news_delta": news_delta,
-        "edge": edge,
-        "kelly": f_kelly,
-        "score": score,
-        "yes_mid_cents": yes_mid_cents,
-        "volume": vol,
-        "hours_to_close": hours_to_close,
+    reasons = {
+        "no_close_time": 0,
+        "expired": 0,
+        "too_soon": 0,
+        "too_far": 0,
+        "low_volume": 0,
+        "high_spread": 0,
+        "price_band": 0,
+        "no_mid": 0,
     }
 
-# ───────────────────────── RISK & SIZING ───────────────────
+    for m in markets:
+        vol = float(m.get("volume_24h") or m.get("volume") or 0)
 
-def allowed_size_dollars(ticker: str, f_kelly: float, exposure: Dict[str, float]) -> float:
-    raw = BANKROLL * f_kelly
-    cap = BANKROLL * PER_MARKET_EXPOSURE_CAP
-    already = exposure.get(ticker, 0.0)
-    remaining = max(0.0, cap - already)
-    return min(raw, remaining)
-
-def risk_filter_and_size(scored: Dict[str, Any], exposure: Dict[str, float]) -> float:
-    if abs(scored["edge"]) < MIN_EDGE:
-        return 0.0
-    if scored["kelly"] <= 0.0:
-        return 0.0
-    size = allowed_size_dollars(scored["ticker"], scored["kelly"], exposure)
-    if size < MIN_DOLLAR_TRADE:
-        return 0.0
-    return size
-
-# ───────────────────────── ORDER PLACEMENT ─────────────────
-
-def place_order_live(scored: Dict[str, Any], size_usd: float) -> Dict:
-    side = "yes" if scored["edge"] > 0 else "no"
-    yes_price_cents = max(1, min(99, int(round(scored["yes_mid_cents"]))))
-    price_dollars = yes_price_cents / 100.0
-    contracts = max(1, int(size_usd / max(price_dollars, 0.01)))
-
-    order_data = {
-        "ticker": scored["ticker"],
-        "action": "buy",
-        "side": side,
-        "type": "limit",
-        "yes_price": yes_price_cents if side == "yes" else 0,
-        "no_price": yes_price_cents if side == "no" else 0,
-        "count": contracts,
-        "client_order_id": str(uuid.uuid4()),
-        "time_in_force": "fill_or_kill",
-    }
-
-    resp = kalshi_post(PRIVATE_KEY, "/portfolio/orders", order_data)
-    if resp.status_code not in (200, 201):
-        raise RuntimeError(f"HTTP {resp.status_code}: {resp.text}")
-    return resp.json()
-
-# ───────────────────────── MAIN ────────────────────────────
-
-def run_agent_once() -> None:
-    mode_str = "PAPER" if PAPER_MODE == "1" else "LIVE"
-    print("\n" + "=" * 65)
-    print(f"🤖 Kalshi Agent v0.3 | {mode_str} | {dt.datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    print("=" * 65)
-
-    # Load persistent exposure
-    exposure = load_positions()
-
-    # Fetch Polymarket cache once per run
-    poly_markets = fetch_polymarket_markets()
-
-    # Fetch Kalshi markets
-    try:
-        markets = fetch_open_markets(limit=300)
-    except Exception as e:
-        log(f"❌ Error fetching Kalshi markets: {e}")
-        return
-
-    log(f"Fetched {len(markets)} open markets from Kalshi")
-
-    candidates = basic_filters(markets)
-    if not candidates:
-        log("No candidates after filters. Done.")
-        print("=" * 65 + "\n")
-        return
-
-    scored = [score_market(m, poly_markets) for m in candidates]
-    scored.sort(key=lambda x: x["score"], reverse=True)
-
-    # Print top 10 candidates for transparency
-    log(f"Top scored candidates (before risk filter):")
-    for s in scored[:10]:
-        print(
-            f"   {s['ticker'][:30]:30s} "
-            f"p_crowd={s['p_crowd']:.2f} p_agent={s['p_agent']:.2f} "
-            f"edge={s['edge']:+.3f} "
-            f"poly_Δ={s['poly_delta']:+.3f} news_Δ={s['news_delta']:+.3f}"
-        )
-
-    trades = []
-    for s in scored:
-        if len(trades) >= MAX_MARKETS_PER_RUN:
-            break
-        size_usd = risk_filter_and_size(s, exposure)
-        if size_usd <= 0.0:
-            continue
-        trades.append((s, size_usd))
-        exposure[s["ticker"]] = exposure.get(s["ticker"], 0.0) + size_usd
-
-    if not trades:
-        log("No trades passed risk filters.")
-        print("=" * 65 + "\n")
-        return
-
-    print()
-    for s, size_usd in trades:
-        side = "YES" if s["edge"] > 0 else "NO"
-        yes_price = s["yes_mid_cents"] / 100.0
-        title = (s["title"] or "")[:70]
-
-        if PAPER_MODE == "1":
-            contracts = max(1, int(size_usd / max(yes_price, 0.01)))
-            log(
-                f"📋 PAPER {side} {s['ticker']} '{title}' "
-                f"${size_usd:.2f} @ ${yes_price:.2f} "
-                f"(p_crowd={s['p_crowd']:.2f} p_agent={s['p_agent']:.2f} "
-                f"edge={s['edge']:+.3f} contracts={contracts})"
+        _ct = m.get("close_time") or m.get("close_ts") or ""
+        try:
+            close_ts = (
+                int(_ct)
+                if str(_ct).isdigit()
+                else int(dt.datetime.fromisoformat(_ct.replace("Z", "+00:00")).timestamp())
             )
-        else:
-            try:
-                result = place_order_live(s, size_usd)
-                order = result.get("order", {})
-                log(
-                    f"✅ LIVE {side} {s['ticker']} '{title}' "
-                    f"${size_usd:.2f} @ ~${yes_price:.2f} "
-                    f"status={order.get('status')} id={order.get('order_id')}"
-                )
-            except Exception as e:
-                log(f"❌ Order failed for {s['ticker']}: {e}")
+        except Exception:
+            reasons["no_close_time"] += 1
+            continue
 
-    save_positions(exposure)
-    log(f"✅ AGENT COMPLETE — {len(trades)} trade(s) in {mode_str} mode")
-    print("=" * 65 + "\n")
+        yes_mid = compute_mid_yes_price_cents(m)
+        if yes_mid is None:
+            reasons["no_mid"] += 1
+            continue
 
+        yes_bid = float(m.get("yes_bid") or yes_mid)
+        yes_ask = float(m.get("yes_ask") or yes_mid)
+        spread = yes_ask - yes_bid
 
-if __name__ == "__main__":
-    run_agent_once()
+        if close_ts <= now_ts:
+            reasons["expired"] += 1
+            continue
+        hours_to_close = (close_ts - now_ts) / 3600.0
+        if hours_to_close < 6:
+            reasons["too_soon"] += 1
+            continue
+        if hours_to_close > 30 * 24:
+            reasons["too_far"] += 1
+            continue
+        if vol < MIN_VOLUME:
+            reasons["low_volume"] += 1
+            continue
+        if spread > MAX_SPREAD_CENTS:
+            reasons["high_spread"] += 1
+            continue
+        if not (10 <= yes_mid <= 90):
+            reasons["price_band"] += 1
+            continue
+
+        m["mid_yes_cents"] = yes_mid
+        m["hours_to_close"] = hours_to_close
+        m["volume_used"] = vol
+        filtered.append(m)
+
+    log(f"Filter breakdown: {reasons}")
+    log(f"Filtered down to {len(filtered)} candidate markets")
+    return filtered
