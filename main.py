@@ -280,29 +280,19 @@ def fetch_open_markets(limit: int = 300) -> List[Dict[str, Any]]:
     r.raise_for_status()
     return r.json().get("markets", [])
 
-def compute_mid_yes_price_cents(m: Dict[str, Any]) -> Optional[float]:
-    bid = m.get("yes_bid")
-    ask = m.get("yes_ask")
-    if bid is not None and ask is not None:
-        return 0.5 * (float(bid) + float(ask))
-    if ask is not None:
-        return float(ask)
-    if bid is not None:
-        return float(bid)
-    return None
-
 def basic_filters(markets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     filtered: List[Dict[str, Any]] = []
     now_ts = int(time.time())
 
     for m in markets:
-        # Use 24h volume if available, fall back to cumulative
         vol = float(m.get("volume_24h") or m.get("volume") or 0)
+
         _ct = m.get("close_time") or m.get("close_ts") or ""
-try:
-    close_ts = int(_ct) if str(_ct).isdigit() else int(dt.datetime.fromisoformat(_ct.replace("Z", "+00:00")).timestamp())
-except Exception:
-    continue
+        try:
+            close_ts = int(_ct) if str(_ct).isdigit() else int(dt.datetime.fromisoformat(_ct.replace("Z", "+00:00")).timestamp())
+        except Exception:
+            continue
+
         yes_mid = compute_mid_yes_price_cents(m)
         if yes_mid is None:
             continue
