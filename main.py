@@ -279,9 +279,21 @@ def fetch_open_markets(limit: int = 300) -> List[Dict[str, Any]]:
     r = kalshi_get(PRIVATE_KEY, "/markets", {"limit": limit, "status": "open"})
     r.raise_for_status()
     return r.json().get("markets", [])
+
 def compute_mid_yes_price_cents(m: Dict[str, Any]) -> Optional[float]:
+    # Try numeric cent fields first (if present)
     bid = m.get("yes_bid")
     ask = m.get("yes_ask")
+
+    # If missing, fall back to dollar-string fields and convert to cents
+    if bid is None and ask is None:
+        bid_d = m.get("yes_bid_dollars")
+        ask_d = m.get("yes_ask_dollars")
+        if bid_d is not None:
+            bid = float(bid_d) * 100.0
+        if ask_d is not None:
+            ask = float(ask_d) * 100.0
+
     if bid is not None and ask is not None:
         return 0.5 * (float(bid) + float(ask))
     if ask is not None:
@@ -289,60 +301,6 @@ def compute_mid_yes_price_cents(m: Dict[str, Any]) -> Optional[float]:
     if bid is not None:
         return float(bid)
     return None
-def basic_filters(markets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    filtered: List[Dict[str, Any]] = []
-    now_ts = int(time.time())
-
-    reasons = {"no_close_time": 0, "expired": 0, "too_soon": 0, "too_far": 0,
-               "low_volume": 0, "high_spread": 0, "price_band": 0, "no_mid": 0}
-
-    for m in markets:
-        vol = float(m.get("volume_24h") or m.get("volume") or 0)
-
-        _ct = m.get("close_time") or m.get("close_ts") or ""
-        try:
-            close_ts = int(_ct) if str(_ct).isdigit() else int(dt.datetime.fromisoformat(_ct.replace("Z", "+00:00")).timestamp())
-        except Exception:
-            reasons["no_close_time"] += 1
-            continue
-
-        yes_mid = compute_mid_yes_price_cents(m)
-        if yes_mid is None:
-            reasons["no_mid"] += 1
-            continue
-
-        yes_bid = float(m.get("yes_bid") or yes_mid)
-        yes_ask = float(m.get("yes_ask") or yes_mid)
-        spread = yes_ask - yes_bid
-
-        if close_ts <= now_ts:
-            reasons["expired"] += 1
-            continue
-        hours_to_close = (close_ts - now_ts) / 3600.0
-        if hours_to_close < 6:
-            reasons["too_soon"] += 1
-            continue
-        if hours_to_close > 30 * 24:
-            reasons["too_far"] += 1
-            continue
-        if vol < MIN_VOLUME:
-            reasons["low_volume"] += 1
-            continue
-        if spread > MAX_SPREAD_CENTS:
-            reasons["high_spread"] += 1
-            continue
-        if not (10 <= yes_mid <= 90):
-            reasons["price_band"] += 1
-            continue
-
-        m["mid_yes_cents"] = yes_mid
-        m["hours_to_close"] = hours_to_close
-        m["volume_used"] = vol
-        filtered.append(m)
-
-    log(f"Filter breakdown: {reasons}")
-    log(f"Filtered down to {len(filtered)} candidate markets")
-    return filtered
 
 # ───────────────────────── PROBABILITY MODEL ───────────────
 
