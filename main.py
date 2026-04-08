@@ -279,7 +279,16 @@ def fetch_open_markets(limit: int = 300) -> List[Dict[str, Any]]:
     r = kalshi_get(PRIVATE_KEY, "/markets", {"limit": limit, "status": "open"})
     r.raise_for_status()
     return r.json().get("markets", [])
-
+def compute_mid_yes_price_cents(m: Dict[str, Any]) -> Optional[float]:
+    bid = m.get("yes_bid")
+    ask = m.get("yes_ask")
+    if bid is not None and ask is not None:
+        return 0.5 * (float(bid) + float(ask))
+    if ask is not None:
+        return float(ask)
+    if bid is not None:
+        return float(bid)
+    return None
 def basic_filters(markets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     filtered: List[Dict[str, Any]] = []
     now_ts = int(time.time())
